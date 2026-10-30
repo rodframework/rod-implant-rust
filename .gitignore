@@ -1,0 +1,24 @@
+# Cargo build output: the tree is a loose set of crates, not a workspace --
+# every manifest root owns its own target dir. The checked-in baked.rs stub
+# is tracked (empty -- the platform's build unit overwrites it in a temp
+# copy at build time).
+target/
+
+# The wire contract copy build.rs probes: fetched by
+# scripts/fetch-rod-proto.sh, never tracked (the proto is the platform
+# repository's contract).
+protos/
+
+# Editor and OS noise
+.vs/
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.user
+*.suo
+*.rsuser
+.DS_Store
+Thumbs.db

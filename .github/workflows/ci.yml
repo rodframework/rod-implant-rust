@@ -1,0 +1,178 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # The nightly full pass on an otherwise quiet tree.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The wire proto ref this tree compiles against (build.rs probes protos/).
+  # The platform repository owns the contract; drift is gated there -- its
+  # conformance lanes run against this repository's pinned releases.
+  ROD_PROTO_REF: main
+
+jobs:
+  implant:
+    name: Format, lint, test, and cross-build
+    # Pinned like every runner here: an unpinned label lets a runner image
+    # change the toolchain under an unchanged tree.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch the wire proto
+        # build.rs compiles rod.proto through a system protoc; the proto is
+        # referenced, not tracked, so CI fetches the copy it builds against.
+        run: scripts/fetch-rod-proto.sh "$ROD_PROTO_REF"
+      - name: Install protoc and the cross linkers
+        # prost-build needs a system protoc; musl-tools and mingw-w64 link
+        # the two reference crosses the implant ships as.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools mingw-w64
+      - name: Add the cross targets
+        # The runner image ships a stable rustup; the targets and components
+        # join it rather than pinning a second toolchain manager.
+        run: |
+          rustup component add clippy rustfmt
+          rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu
+      - name: Cache the Rust build trees
+        # Every manifest here owns its target dir (the tree is a loose set
+        # of crates, not a workspace), and the job's clippy, test, and
+        # shape builds are cold compiles of them all on every run. The
+        # cache makes them incremental; keyed on the tree's lockfiles --
+        # a source-only change keeps the compiled dependency layer, and
+        # the restore-key prefix rides a dependency bump -- because a
+        # toolchain roll invalidates inside cargo's fingerprints, not the
+        # key.
+        uses: actions/cache@v6
+        with:
+          path: |
+            target
+            loader/target
+            plugin-sdk/target
+            modules/*/target
+            carrier/target
+          key: rust-implant-${{ hashFiles('Cargo.lock', 'loader/Cargo.lock', 'plugin-sdk/Cargo.lock', 'modules/*/Cargo.lock', 'carrier/Cargo.lock') }}
+          restore-keys: rust-implant-
+      - name: Format check
+        # The plugin modules join by directory shape (every manifest under
+        # modules/), the same zero-touch rule the ecosystem lanes hold.
+        run: |
+          cargo fmt -- --check
+          cargo fmt --manifest-path plugin-sdk/Cargo.toml -- --check
+          for manifest in modules/*/Cargo.toml; do
+            cargo fmt --manifest-path "$manifest" -- --check
+          done
+      - name: Lint
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features wireguard -- -D warnings
+          cargo clippy --manifest-path plugin-sdk/Cargo.toml --all-targets -- -D warnings
+          for manifest in modules/*/Cargo.toml; do
+            cargo clippy --manifest-path "$manifest" --all-targets -- -D warnings
+          done
+      - name: Unit tests
+        # The crate's #[cfg(test)] suites in both feature configurations
+        # (the wireguard carriage's tests ride the feature build), the
+        # plugin SDK's ABI shims, and every module's own suite per
+        # manifest. The live-behavior half -- enrolls, contacts, tasking
+        # against a real teamserver -- lives in the platform's lanes.
+        run: |
+          cargo test
+          cargo test --features wireguard
+          cargo test --manifest-path plugin-sdk/Cargo.toml
+          for manifest in modules/*/Cargo.toml; do
+            cargo test --manifest-path "$manifest"
+          done
+      - name: Build the plugin seam's shipped shapes
+        # Every plugin module in every shape a target loads: the Linux
+        # executable the loader execs (the musl-static build is the
+        # delivery shape -- no libc coupling), and the Windows cdylib the
+        # manual PE map carries.
+        run: |
+          for manifest in modules/*/Cargo.toml; do
+            cargo build --release --manifest-path "$manifest"
+            cargo build --release --target x86_64-unknown-linux-musl --manifest-path "$manifest"
+            cargo build --release --target x86_64-pc-windows-gnu --manifest-path "$manifest"
+          done
+      - name: Build the reference crosses
+        # The implant of record's shipped shapes: static musl on Linux,
+        # mingw on Windows. Building both on every push keeps the crosses
+        # from rotting behind host-only builds.
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-pc-windows-gnu
+      - name: Verify the static binary
+        # The unbaked binary's documented refusal -- no profile, no run,
+        # exit 2 -- proves the static artifact actually executes on the
+        # runner.
+        run: |
+          set -e
+          bin=target/x86_64-unknown-linux-musl/release/rod-implant
+          test -x "$bin"
+          ls -lh "$bin"
+          set +e
+          "$bin"
+          code=$?
+          set -e
+          test "$code" -eq 2
+      - name: Link the C shell against the static library
+        # The linkable core (the C-ABI embedding surface) proven natively:
+        # the staticlib cargo emits, the worked C shell linked against it
+        # with the documented command, and the same unbaked refusal.
+        run: |
+          cargo build --release
+          cc -O2 -Wall -Wextra -o target/rod-shell shell/main.c target/release/librod_implant.a -lpthread -lm -ldl
+          set +e
+          ./target/rod-shell
+          code=$?
+          set -e
+          test "$code" -eq 2
+
+  pipeline:
+    name: Build through the platform's Rust build unit
+    # The platform's build unit drives this tree exactly as a release build
+    # would: it stages the crate, copies the proto beside it, bakes the
+    # profile, and compiles through cargo. Running the platform's
+    # build-unit tests against this checkout catches the coupling a native
+    # lane cannot see (staging layout, extension overlay merge, loader
+    # bake) before a tag ships it.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Clone the platform repository
+        run: git clone --depth 1 https://github.com/rodframework/Rod.git "$RUNNER_TEMP/Rod"
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: ${{ runner.temp }}/Rod/global.json
+      - name: Install the build unit's toolchain
+        # The same set the platform's own lane installs: protoc for
+        # prost-build, the musl and mingw linkers for the cross tests, the
+        # aarch64 musl std for the loader link test.
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools mingw-w64
+          rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu i686-pc-windows-gnu aarch64-unknown-linux-musl
+          echo "ROD_RUST_TARGET_DIR=${RUNNER_TEMP}/rod-rust-target" >> "$GITHUB_ENV"
+      - name: Cache the shared Rust target dir
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/rod-rust-target
+          key: rust-targets-${{ hashFiles('Cargo.lock') }}
+          restore-keys: rust-targets-
+      - name: Run the platform's build-unit tests against this tree
+        # ROD_IMPLANT_RUST_DIR points the platform's source resolution at
+        # this checkout instead of its pinned release; the unit stages and
+        # copies the proto itself, so no local protos/ is needed here.
+        env:
+          ROD_IMPLANT_RUST_DIR: ${{ github.workspace }}
+        run: >-
+          dotnet test "$RUNNER_TEMP/Rod/tests/teamserver/Rod.Build.Tests/Rod.Build.Tests.csproj"
+          --configuration Release
+          --filter "FullyQualifiedName~RustBuildUnitTests|FullyQualifiedName~RustExtensionOverlayTests"
