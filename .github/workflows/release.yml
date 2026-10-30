@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Smoke-build and publish the source asset
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch the wire proto
+        # The smoke build needs the contract the crate compiles against;
+        # the asset itself never carries a proto copy (the proto stays the
+        # platform repository's contract).
+        run: scripts/fetch-rod-proto.sh
+      - name: Smoke-build the release shape
+        # The asset is source, but a tag whose tree does not build is worse
+        # than no tag: the static musl cross is the shipped shape.
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl
+      - name: Pack the source asset
+        # The pinned-tarball contract: the asset carries this tree's sources
+        # under the src/implant/rust prefix the platform's rod-src.tar.gz
+        # assembly and build-unit staging both layout-match. Deterministic
+        # flags (sorted names, zeroed mtime and ownership, gzip -n) so the
+        # sha256 the platform's lock pins is the same bytes any host packing
+        # the same tag produces.
+        run: |
+          stage="$(mktemp -d)"
+          mkdir -p "$stage/src/implant/rust"
+          tar -cf - --exclude=.git --exclude=target --exclude=protos . \
+            | tar -xf - -C "$stage/src/implant/rust"
+          asset="rod-implant-rust-src-${GITHUB_REF_NAME}.tar.gz"
+          tar -czf "$asset" --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -C "$stage" src
+          sha256sum "$asset" > "${asset}.sha256"
+          ls -lh "$asset"
+          echo "asset=$asset" >> "$GITHUB_ENV"
+      - name: Create the release
+        # gh is first-party and preinstalled on the runner; the token is the
+        # job's own, scoped by the permissions block above.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" \
+            --title "rod-implant-rust ${GITHUB_REF_NAME#v}" \
+            --generate-notes \
+            "${flags[@]}" \
+            "$asset" "${asset}.sha256"
