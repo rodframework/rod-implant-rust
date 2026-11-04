@@ -92,24 +92,32 @@ impl WireGuard {
     /// verbatim on the next cycle.
     fn attempt_poll(&mut self, session: &mut Session) -> Result<Attempt, ContactError> {
         session.drain_channels();
-        let demands = session.staged_demands();
-        let batch = session.outbox.batch();
-        let exfil = session.exfil_frames(crate::session::EXFIL_CONTACT_BUDGET);
-        let mut frames = Vec::with_capacity(1 + demands.len() + batch.len() + exfil.len());
-        frames.push(session.handshake_frame());
-        frames.extend(demands);
-        frames.extend(batch.iter().cloned());
-        frames.extend(exfil);
+        // The session-key arm's agreement contact rides alone when no keys
+        // are held: the demands and batch wait for the session it opens.
+        let frames = if session.needs_agreement() {
+            vec![session.handshake_frame()]
+        } else {
+            let demands = session.staged_demands();
+            let batch = session.outbox.batch();
+            let exfil = session.exfil_frames(crate::session::EXFIL_CONTACT_BUDGET);
+            let mut frames = Vec::with_capacity(1 + demands.len() + batch.len() + exfil.len());
+            frames.push(session.handshake_frame());
+            frames.extend(demands);
+            frames.extend(batch.iter().cloned());
+            frames.extend(exfil);
+            frames
+        };
+        let batch_len = frames.len() - 1;
         let (body, _) = session.encode_outgoing(&frames);
 
         let tunnel = self.tunnel()?;
         let answer = tunnel.exchange(&body)?;
 
-        let inbound = session
-            .decode_incoming(&answer)
-            .ok_or(ContactError::Protocol(
-                "the contact answer did not verify under the baked key",
-            ))?;
+        let Some(inbound) = session.decode_incoming(&answer) else {
+            return Err(ContactError::Protocol(
+                "the contact answer did not verify under the active seal",
+            ));
+        };
         let first = inbound.first().ok_or(ContactError::Protocol(
             "the contact answer carried no frames",
         ))?;
@@ -119,7 +127,7 @@ impl WireGuard {
         if let Attempt::Refused = attempt {
             return Ok(attempt);
         }
-        session.outbox.batch_crossed(batch.len());
+        session.outbox.batch_crossed(batch_len);
         super::http::accept_staged(session, &inbound);
         super::accept_tasking(session, &inbound[1..], acks);
         session.drain_channels();
@@ -131,7 +139,13 @@ impl WireGuard {
 
 impl Contact for WireGuard {
     fn attempt(&mut self, session: &mut Session) -> Result<Attempt, ContactError> {
-        self.attempt_poll(session)
+        let outcome = self.attempt_poll(session);
+        if outcome.is_err() {
+            // A failed exchange is the session-key arm's fallback signal too:
+            // drop the keys so the next cycle offers a fresh agreement.
+            session.drop_session_keys();
+        }
+        outcome
     }
 }
 

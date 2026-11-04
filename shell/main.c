@@ -7,6 +7,7 @@
  * wherever the Rust one goes, `rod conform` included:
  *
  *   ROD_ENROLL_URL, ROD_DEPLOY_TOKEN, ROD_KILL_DATE   the contract (implants.md)
+ *   ROD_ENVELOPE_KEY                                  the sealed posture's baked key
  *   ROD_VERBS, ROD_MODE, ROD_SLEEP, ROD_JITTER        the dev-shape knobs
  *
  * Silent by default: the core owns the ROD_VERBOSE diagnostics and this
@@ -72,6 +73,7 @@ int main(void)
     profile.deploy_token = env_or("ROD_DEPLOY_TOKEN", "");
     profile.kill_date = getenv("ROD_KILL_DATE");
     profile.verbs = getenv("ROD_VERBS");
+    profile.envelope_key = getenv("ROD_ENVELOPE_KEY");
     profile.mode = env_or("ROD_MODE", "poll");
     profile.sleep_seconds = seconds_or("ROD_SLEEP", k_default_sleep);
     profile.jitter_seconds = seconds_or("ROD_JITTER", k_default_jitter);

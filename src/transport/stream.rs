@@ -149,6 +149,20 @@ impl ReadWrite for rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
 
 impl Contact for Stream {
     fn attempt(&mut self, session: &mut Session) -> Result<Attempt, ContactError> {
+        let outcome = self.attempt_inner(session);
+        if outcome.is_err() {
+            // A stream that died before or during its session is the
+            // session-key arm's fallback signal: drop the keys so the
+            // reconnect offers a fresh agreement instead of wedging on a
+            // session the server no longer holds.
+            session.drop_session_keys();
+        }
+        outcome
+    }
+}
+
+impl Stream {
+    fn attempt_inner(&mut self, session: &mut Session) -> Result<Attempt, ContactError> {
         let mut socket = self.connect()?;
 
         // The implant speaks first: the request-body shape with the
